@@ -3,15 +3,7 @@
 #include "kernel/types.h"
 #include "user/user.h"
 #include "kernel/fcntl.h"
-
 #include "kernel/param.h"
-static int jobs[NPROC]; // 0 表示空
-static void jobs_add(int pid){ for(int i=0;i<NPROC;i++) if(!jobs[i]){ jobs[i]=pid; return; } }
-static void jobs_del(int pid){ for(int i=0;i<NPROC;i++) if(jobs[i]==pid){ jobs[i]=0; return; } }
-static void jobs_print(void){
-  for(int i=0;i<NPROC;i++) if(jobs[i]) printf("%d\n", jobs[i]);
-}
-
 
 // Parsed command representation
 #define EXEC  1
@@ -30,6 +22,7 @@ struct execcmd {
   int type;
   char *argv[MAXARGS];
   char *eargv[MAXARGS];
+  int back; // Custom flag: 1 if this EXEC is in background
 };
 
 struct redircmd {
@@ -61,7 +54,85 @@ struct backcmd {
 int fork1(void);  // Fork but panics on failure.
 void panic(char*);
 struct cmd *parsecmd(char*);
-void runcmd(struct cmd*) __attribute__((noreturn));
+
+// Global job list
+int bg_jobs[NPROC];
+
+// Helper: Add a job
+void add_job(int pid) {
+    for (int i = 0; i < NPROC; i++) {
+        if (bg_jobs[i] == 0) {
+            bg_jobs[i] = pid;
+            return;
+        }
+    }
+}
+
+// Helper: Remove a job
+void remove_job(int pid) {
+    for (int i = 0; i < NPROC; i++) {
+        if (bg_jobs[i] == pid) {
+            bg_jobs[i] = 0;
+            return;
+        }
+    }
+}
+
+// Helper: Check if a PID is a background job
+int is_bg_job(int pid) {
+    for (int i = 0; i < NPROC; i++) {
+        if (bg_jobs[i] == pid) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Helper: Print jobs
+void print_jobs() {
+    for (int i = 0; i < NPROC; i++) {
+        if (bg_jobs[i] != 0) {
+            printf("%d\n", bg_jobs[i]);
+        }
+    }
+}
+
+// Helper: Process a reaped job
+void reap_background_job(int pid, int status) {
+    if(is_bg_job(pid)) {
+        remove_job(pid);
+        printf("[bg %d] exited with status %d\n", pid, status);
+    }
+}
+
+// Helper: Reap all available zombie background jobs
+void reap_zombies() {
+    int status;
+    int pid;
+    while ((pid = wait_noblock(&status)) > 0) {
+        reap_background_job(pid, status);
+    }
+}
+
+// Helper: Wait for a specific foreground process
+// This is critical for Case 6
+void wait_for_foreground(int foreground_pid) {
+    int status;
+    int reaped_pid;
+    
+    // Wait for *a* child to exit
+    while((reaped_pid = wait(&status)) > 0) {
+        if (reaped_pid == foreground_pid) {
+            // Our foreground job finished. We're done.
+            break;
+        } else {
+            // We accidentally reaped a background job.
+            // Process it and keep waiting.
+            reap_background_job(reaped_pid, status);
+        }
+    }
+}
+
 
 // Execute cmd.  Never returns.
 void
@@ -73,6 +144,8 @@ runcmd(struct cmd *cmd)
   struct listcmd *lcmd;
   struct pipecmd *pcmd;
   struct redircmd *rcmd;
+  int pid;
+  int pid_left;
 
   if(cmd == 0)
     exit(1);
@@ -85,8 +158,38 @@ runcmd(struct cmd *cmd)
     ecmd = (struct execcmd*)cmd;
     if(ecmd->argv[0] == 0)
       exit(1);
-    exec(ecmd->argv[0], ecmd->argv);
-    fprintf(2, "exec %s failed\n", ecmd->argv[0]);
+
+    // Handle built-in 'cd'
+    if(strcmp(ecmd->argv[0], "cd") == 0){
+        if(ecmd->argv[1] == 0 || chdir(ecmd->argv[1]) < 0)
+            fprintf(2, "cannot cd %s\n", ecmd->argv[1] ? ecmd->argv[1] : "");
+        // 'cd' is built-in, so we don't exit the shell
+        return; 
+    }
+
+    // Handle built-in 'jobs'
+    if(strcmp(ecmd->argv[0], "jobs") == 0){
+        print_jobs();
+        return;
+    }
+
+    // Fork for the exec
+    pid = fork1();
+    if(pid == 0) { // Child
+      exec(ecmd->argv[0], ecmd->argv);
+      fprintf(2, "exec %s failed\n", ecmd->argv[0]);
+      exit(1); // Use 1 for failure
+    }
+    
+    // Parent
+    if(ecmd->back){
+        // This is a background job
+        add_job(pid);
+        printf("[%d]\n", pid);
+    } else {
+        // This is a foreground job
+        wait_for_foreground(pid);
+    }
     break;
 
   case REDIR:
@@ -101,9 +204,12 @@ runcmd(struct cmd *cmd)
 
   case LIST:
     lcmd = (struct listcmd*)cmd;
-    if(fork1() == 0)
-      runcmd(lcmd->left);
-    wait(0);
+    // We run the left side.
+    // If it's foreground, we wait. If background, we don't.
+    // The fork/wait logic is handled *inside* the recursive call.
+    runcmd(lcmd->left);
+    
+    // Then we run the right side.
     runcmd(lcmd->right);
     break;
 
@@ -111,87 +217,151 @@ runcmd(struct cmd *cmd)
     pcmd = (struct pipecmd*)cmd;
     if(pipe(p) < 0)
       panic("pipe");
-    if(fork1() == 0){
+    
+    pid_left = fork1();
+    if(pid_left == 0){ // Left child
       close(1);
       dup(p[1]);
       close(p[0]);
       close(p[1]);
       runcmd(pcmd->left);
+      exit(0);
     }
-    if(fork1() == 0){
+
+    int pid_right = fork1();
+    if(pid_right == 0){ // Right child
       close(0);
       dup(p[0]);
       close(p[0]);
       close(p[1]);
       runcmd(pcmd->right);
+      exit(0);
     }
+    
     close(p[0]);
     close(p[1]);
-    wait(0);
-    wait(0);
+
+    // This pipe command might be in the background
+    // We check the 'back' flag on the *left* side (arbitrary, both are part of pipe)
+    int is_background = 0;
+    if(pcmd->left->type == EXEC)
+        is_background = ((struct execcmd*)pcmd->left)->back;
+    else if (pcmd->right->type == EXEC)
+        is_background = ((struct execcmd*)pcmd->right)->back;
+
+    if(is_background){
+        // Lab requires printing PID of the first command
+        add_job(pid_left);
+        // We also add the right job, so it can be reaped
+        // but we only print the first one.
+        add_job(pid_right); 
+        printf("[%d]\n", pid_left);
+    } else {
+        // Wait for both foreground children
+        wait_for_foreground(pid_left);
+        wait_for_foreground(pid_right);
+    }
     break;
 
   case BACK:
     bcmd = (struct backcmd*)cmd;
-    if(fork1() == 0)
-      runcmd(bcmd->cmd);
+
+    // Mark the inner command as 'background'
+    // This is a bit of a hack, but `parsecmd` doesn't do it.
+    // We only need to handle EXEC and PIPE.
+    if(bcmd->cmd->type == EXEC) {
+        ((struct execcmd*)bcmd->cmd)->back = 1;
+    } else if (bcmd->cmd->type == PIPE) {
+        struct pipecmd* p = (struct pipecmd*)bcmd->cmd;
+        if(p->left->type == EXEC) ((struct execcmd*)p->left)->back = 1;
+        if(p->right->type == EXEC) ((struct execcmd*)p->right)->back = 1;
+    }
+    
+    runcmd(bcmd->cmd);
     break;
   }
-  exit(0);
+  
+  // Only the initial shell process should reach here.
+  // Child processes will exit(1) or return from built-ins.
 }
 
 int
-getcmd(char *buf, int nbuf)
+getcmd(char *buf, int nbuf, int fd)
 {
-  write(2, "$ ", 2);
+  if(fd == 0) {
+    // Interactive mode
+    fprintf(2, "$ ");
+  }
+  
   memset(buf, 0, nbuf);
-  gets(buf, nbuf);
-  if(buf[0] == 0) // EOF
+  
+  // Read a line from fd
+  char *p = buf;
+  int i = 0;
+  while(i < nbuf - 1) {
+    if(read(fd, p, 1) != 1) {
+      if (i == 0) // EOF or error
+        return -1;
+      break; // End of input
+    }
+    if(*p == '\n')
+      break;
+    p++;
+    i++;
+  }
+  *p = '\0'; // Null-terminate
+
+  if(buf[0] == 0) // Handle empty input or EOF
     return -1;
+
   return 0;
 }
 
 int
-main(int argc, char* argv[])
+main(int argc, char *argv[])
 {
   static char buf[100];
-  int fd = 0;
-  
-  if(argc > 1){
-    fd = open(argv[1], 0);
-    if(fd < 0){ printf("sh: cannot open %s\n", argv[1]); exit(1); }
-    dup2(fd, 0); close(fd);
-  }
+  int fd;
 
-  // Ensure that three file descriptors are open.
-  while((fd = open("console", O_RDWR)) >= 0){
-    if(fd >= 3){
-      close(fd);
-      break;
+  // Init job list
+  for(int i = 0; i < NPROC; i++)
+    bg_jobs[i] = 0;
+
+  // Shell script execution (Step 4)
+  if(argc > 1){
+    // Run from script
+    if((fd = open(argv[1], O_RDONLY)) < 0){
+      fprintf(2, "sh: cannot open %s\n", argv[1]);
+      exit(1);
     }
+  } else {
+    // Interactive mode
+    fd = 0;
   }
 
   // Read and run input commands.
-  while(getcmd(buf, sizeof(buf)) >= 0){
-    if(buf[0] == 'c' && buf[1] == 'd' && buf[2] == ' '){
-      // Chdir must be called by the parent, not the child.
-      buf[strlen(buf)-1] = 0;  // chop \n
-      if(chdir(buf+3) < 0)
-        fprintf(2, "cannot cd %s\n", buf+3);
-      continue;
+  while(getcmd(buf, sizeof(buf), fd) >= 0){
+    if(fd == 0) {
+      // In interactive mode, reap zombies *before* running cmd
+      // This catches jobs that finished while user was typing
+      reap_zombies();
     }
-    if(fork1() == 0)
-      runcmd(parsecmd(buf));
-    wait(0);
-  }
-  exit(0);
-}
+    
+    if(buf[0] == '\n' || buf[0] == 0) // Empty line
+      continue;
 
-void
-panic(char *s)
-{
-  fprintf(2, "%s\n", s);
-  exit(1);
+    // Run the command
+    runcmd(parsecmd(buf));
+
+    if(fd == 0) {
+      // In interactive mode, reap zombies *after* running cmd
+      // This catches jobs that finish quickly,
+      // and reaps foreground jobs (Case 6)
+      reap_zombies();
+    }
+  }
+
+  exit(0);
 }
 
 int
@@ -204,6 +374,14 @@ fork1(void)
     panic("fork");
   return pid;
 }
+
+void
+panic(char *s)
+{
+  fprintf(2, "%s\n", s);
+  exit(1);
+}
+
 
 //PAGEBREAK!
 // Constructors
@@ -508,10 +686,4 @@ nulterminate(struct cmd *cmd)
   return cmd;
 }
 
-static void reap_bg(void){
-  int st, pid;
-  while ((pid = wait_noblock(&st)) > 0) {
-    jobs_del(pid);
-    printf("[bg %d] exited with status %d\n", pid, st);
-  }
-}
+

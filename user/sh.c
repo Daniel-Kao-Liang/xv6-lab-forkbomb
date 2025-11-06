@@ -4,6 +4,15 @@
 #include "user/user.h"
 #include "kernel/fcntl.h"
 
+#include "kernel/param.h"
+static int jobs[NPROC]; // 0 表示空
+static void jobs_add(int pid){ for(int i=0;i<NPROC;i++) if(!jobs[i]){ jobs[i]=pid; return; } }
+static void jobs_del(int pid){ for(int i=0;i<NPROC;i++) if(jobs[i]==pid){ jobs[i]=0; return; } }
+static void jobs_print(void){
+  for(int i=0;i<NPROC;i++) if(jobs[i]) printf("%d\n", jobs[i]);
+}
+
+
 // Parsed command representation
 #define EXEC  1
 #define REDIR 2
@@ -491,4 +500,12 @@ nulterminate(struct cmd *cmd)
     break;
   }
   return cmd;
+}
+
+static void reap_bg(void){
+  int st, pid;
+  while ((pid = wait_noblock(&st)) > 0) {
+    jobs_del(pid);
+    printf("[bg %d] exited with status %d\n", pid, st);
+  }
 }

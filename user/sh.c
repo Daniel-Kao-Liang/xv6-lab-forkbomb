@@ -343,9 +343,9 @@ main(int argc, char *argv[])
   while(1){
     // 1. (僅限互動模式) 收割上一輪的僵屍
     //    這保證 `[bg ...]` 訊息在 `$` 之前印出
-    if(fd == 0) {
-        reap_zombies();
-    }
+    // if(fd == 0) {
+    //     reap_zombies();
+    // }
 
     // 2. (僅限互動模式) 印出提示符
     if(fd == 0) {
@@ -366,6 +366,7 @@ main(int argc, char *argv[])
 
     if(fd == 0){
       reap_zombies();
+
     }
   }
   

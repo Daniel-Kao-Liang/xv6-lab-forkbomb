@@ -152,10 +152,16 @@ getcmd(char *buf, int nbuf)
 }
 
 int
-main(void)
+main(int argc, char* argv[])
 {
   static char buf[100];
-  int fd;
+  int fd = 0;
+  
+  if(argc > 1){
+    fd = open(argv[1], 0);
+    if(fd < 0){ printf("sh: cannot open %s\n", argv[1]); exit(1); }
+    dup2(fd, 0); close(fd);
+  }
 
   // Ensure that three file descriptors are open.
   while((fd = open("console", O_RDWR)) >= 0){

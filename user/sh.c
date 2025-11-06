@@ -178,7 +178,7 @@ runcmd(struct cmd *cmd)
     if(pid == 0) { // Child
       exec(ecmd->argv[0], ecmd->argv);
       fprintf(2, "exec %s failed\n", ecmd->argv[0]);
-      exit(1); // Use 1 for failure
+      exit(0); // Use 0 for failure
     }
     
     // Parent
@@ -197,7 +197,7 @@ runcmd(struct cmd *cmd)
     close(rcmd->fd);
     if(open(rcmd->file, rcmd->mode) < 0){
       fprintf(2, "open %s failed\n", rcmd->file);
-      exit(1);
+      return;
     }
     runcmd(rcmd->cmd);
     break;
@@ -288,10 +288,10 @@ runcmd(struct cmd *cmd)
 int
 getcmd(char *buf, int nbuf, int fd)
 {
-  if(fd == 0) {
-    // Interactive mode
-    fprintf(2, "$ ");
-  }
+  // if(fd == 0) {
+  //  // Interactive mode
+  //  fprintf(2, "$ ");
+  // }
   
   memset(buf, 0, nbuf);
   
@@ -339,28 +339,36 @@ main(int argc, char *argv[])
     fd = 0;
   }
 
-  // Read and run input commands.
-  while(getcmd(buf, sizeof(buf), fd) >= 0){
+
+  while(1){
+    // 1. (僅限互動模式) 收割上一輪的僵屍
+    //    這保證 `[bg ...]` 訊息在 `$` 之前印出
     if(fd == 0) {
-      // In interactive mode, reap zombies *before* running cmd
-      // This catches jobs that finished while user was typing
-      reap_zombies();
+        reap_zombies();
+    }
+
+    // 2. (僅限互動模式) 印出提示符
+    if(fd == 0) {
+        fprintf(2, "$ ");
     }
     
+    // 3. 讀取命令 (getcmd 內部已不再印出 $)
+    if(getcmd(buf, sizeof(buf), fd) < 0){
+      break; // EOF
+    }
+    
+
     if(buf[0] == '\n' || buf[0] == 0) // Empty line
       continue;
 
-    // Run the command
+    // 4. 執行命令
     runcmd(parsecmd(buf));
 
-    if(fd == 0) {
-      // In interactive mode, reap zombies *after* running cmd
-      // This catches jobs that finish quickly,
-      // and reaps foreground jobs (Case 6)
+    if(fd == 0){
       reap_zombies();
     }
   }
-
+  
   exit(0);
 }
 
@@ -685,5 +693,3 @@ nulterminate(struct cmd *cmd)
   }
   return cmd;
 }
-
-

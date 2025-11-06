@@ -187,3 +187,7 @@ void            virtio_disk_intr(void);
 
 // number of elements in fixed-size array
 #define NELEM(x) (sizeof(x)/sizeof((x)[0]))
+
+//add
+int wait_noblock(uint64);
+uint64 sys_wait_noblock(void);

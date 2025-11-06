@@ -22,6 +22,7 @@ int getpid(void);
 char* sbrk(int);
 int sleep(int);
 int uptime(void);
+int wait_noblock(int *status);
 
 // ulib.c
 int stat(const char*, struct stat*);

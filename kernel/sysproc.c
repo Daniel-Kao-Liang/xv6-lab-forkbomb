@@ -91,3 +91,12 @@ sys_uptime(void)
   release(&tickslock);
   return xticks;
 }
+
+
+uint64
+sys_wait_noblock(void)
+{
+  uint64 uva_status;
+  argaddr(0, &uva_status);
+  return wait_noblock(uva_status);
+}

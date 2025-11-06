@@ -434,6 +434,22 @@ wait(uint64 addr)
   }
 }
 
+int
+wait_noblock(uint64 uva_status) {
+  struct proc *p = myproc();
+  for(struct proc *pp = proc; pp < &proc[NPROC]; pp++){
+    if(pp->parent == p && pp->state == ZOMBIE){
+      int pid = pp->pid;
+      if(copyout(p->pagetable, uva_status, (char*)&pp->xstate, sizeof(int)) < 0)
+        return -1;
+      freeproc(pp);
+      return pid;
+    }
+  }
+  return 0;
+}
+
+
 // Per-CPU process scheduler.
 // Each CPU calls scheduler() after setting itself up.
 // Scheduler never returns.  It loops, doing:

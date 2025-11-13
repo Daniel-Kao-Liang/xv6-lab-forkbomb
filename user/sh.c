@@ -14,6 +14,10 @@
 
 #define MAXARGS 10
 
+int shellpid;
+static inline int is_shell(void){ return getpid() == shellpid; }
+
+
 struct cmd {
   int type;
 };
@@ -54,11 +58,11 @@ struct backcmd {
 int fork1(void);  // Fork but panics on failure.
 void panic(char*);
 struct cmd *parsecmd(char*);
+int getcmd(char *buf, int nbuf, int fd);
 
-// Global job list
+
 int bg_jobs[NPROC];
 
-// Helper: Add a job
 void add_job(int pid) {
     for (int i = 0; i < NPROC; i++) {
         if (bg_jobs[i] == 0) {
@@ -68,7 +72,7 @@ void add_job(int pid) {
     }
 }
 
-// Helper: Remove a job
+
 void remove_job(int pid) {
     for (int i = 0; i < NPROC; i++) {
         if (bg_jobs[i] == pid) {
@@ -78,7 +82,7 @@ void remove_job(int pid) {
     }
 }
 
-// Helper: Check if a PID is a background job
+
 int is_bg_job(int pid) {
     for (int i = 0; i < NPROC; i++) {
         if (bg_jobs[i] == pid) {
@@ -88,7 +92,6 @@ int is_bg_job(int pid) {
     return 0;
 }
 
-// Helper: Print jobs
 void print_jobs() {
     for (int i = 0; i < NPROC; i++) {
         if (bg_jobs[i] != 0) {
@@ -97,42 +100,56 @@ void print_jobs() {
     }
 }
 
-// Helper: Process a reaped job
-void reap_background_job(int pid, int status) {
-    if(is_bg_job(pid)) {
-        remove_job(pid);
-        printf("[bg %d] exited with status %d\n", pid, status);
-    }
-}
 
-// Helper: Reap all available zombie background jobs
 void reap_zombies() {
     int status;
     int pid;
     while ((pid = wait_noblock(&status)) > 0) {
-        reap_background_job(pid, status);
-    }
-}
-
-// Helper: Wait for a specific foreground process
-// This is critical for Case 6
-void wait_for_foreground(int foreground_pid) {
-    int status;
-    int reaped_pid;
-    
-    // Wait for *a* child to exit
-    while((reaped_pid = wait(&status)) > 0) {
-        if (reaped_pid == foreground_pid) {
-            // Our foreground job finished. We're done.
-            break;
-        } else {
-            // We accidentally reaped a background job.
-            // Process it and keep waiting.
-            reap_background_job(reaped_pid, status);
+        if (is_bg_job(pid)) {
+            remove_job(pid);
+            printf("[bg %d] exited with status %d\n", pid, status);
         }
     }
 }
 
+void wait_for_foreground(int foreground_pid) {
+    int status;
+    int reaped_pid;
+    
+    while ((reaped_pid = wait(&status)) > 0) {
+        if (reaped_pid == foreground_pid) {
+            break;
+        } else if (is_bg_job(reaped_pid)) {
+         
+            remove_job(reaped_pid);
+            printf("[bg %d] exited with status %d\n", reaped_pid, status);
+         
+        }
+    }
+}
+
+
+void set_background_flag(struct cmd *cmd) {
+    if (cmd == 0) return;
+
+    switch (cmd->type) {
+        case EXEC:
+            ((struct execcmd *)cmd)->back = 1;
+            break;
+        case PIPE:
+            set_background_flag(((struct pipecmd *)cmd)->left);
+            set_background_flag(((struct pipecmd *)cmd)->right);
+            break;
+        case REDIR:
+            set_background_flag(((struct redircmd *)cmd)->cmd);
+            break;
+        case LIST:
+            set_background_flag(((struct listcmd *)cmd)->left);
+            set_background_flag(((struct listcmd *)cmd)->right);
+            break;
+        // BACK 類型由 runcmd(BACK) 處理
+    }
+}
 
 // Execute cmd.  Never returns.
 void
@@ -144,11 +161,10 @@ runcmd(struct cmd *cmd)
   struct listcmd *lcmd;
   struct pipecmd *pcmd;
   struct redircmd *rcmd;
-  int pid;
-  int pid_left;
+  int pid, pid_left, pid_right;
 
   if(cmd == 0)
-    exit(1);
+    return; 
 
   switch(cmd->type){
   default:
@@ -156,40 +172,40 @@ runcmd(struct cmd *cmd)
 
   case EXEC:
     ecmd = (struct execcmd*)cmd;
-    if(ecmd->argv[0] == 0)
-      exit(1);
+    if(ecmd->argv[0] == 0) {
+      return; 
+    }
 
-    // Handle built-in 'cd'
     if(strcmp(ecmd->argv[0], "cd") == 0){
-        if(ecmd->argv[1] == 0 || chdir(ecmd->argv[1]) < 0)
-            fprintf(2, "cannot cd %s\n", ecmd->argv[1] ? ecmd->argv[1] : "");
-        // 'cd' is built-in, so we don't exit the shell
-        return; 
+      if(ecmd->argv[1] == 0 || chdir(ecmd->argv[1]) < 0)
+        fprintf(2, "exec cd failed\n");
+      return;
     }
 
-    // Handle built-in 'jobs'
     if(strcmp(ecmd->argv[0], "jobs") == 0){
-        print_jobs();
-        return;
+      print_jobs();
+      return; 
     }
 
-    // Fork for the exec
     pid = fork1();
-    if(pid == 0) { // Child
+    if(pid == 0) { 
       exec(ecmd->argv[0], ecmd->argv);
       fprintf(2, "exec %s failed\n", ecmd->argv[0]);
-      exit(0); // Use 0 for failure
+      exit(0);
     }
-    
-    // Parent
-    if(ecmd->back){
-        // This is a background job
+
+    if (is_shell()) {
+      if (ecmd->back) {
         add_job(pid);
         printf("[%d]\n", pid);
-    } else {
-        // This is a foreground job
+      } else {
         wait_for_foreground(pid);
+      }
+    } else {
+      int st;
+      wait(&st);
     }
+
     break;
 
   case REDIR:
@@ -197,19 +213,14 @@ runcmd(struct cmd *cmd)
     close(rcmd->fd);
     if(open(rcmd->file, rcmd->mode) < 0){
       fprintf(2, "open %s failed\n", rcmd->file);
-      return;
+      return; 
     }
     runcmd(rcmd->cmd);
     break;
 
   case LIST:
     lcmd = (struct listcmd*)cmd;
-    // We run the left side.
-    // If it's foreground, we wait. If background, we don't.
-    // The fork/wait logic is handled *inside* the recursive call.
     runcmd(lcmd->left);
-    
-    // Then we run the right side.
     runcmd(lcmd->right);
     break;
 
@@ -219,7 +230,7 @@ runcmd(struct cmd *cmd)
       panic("pipe");
     
     pid_left = fork1();
-    if(pid_left == 0){ // Left child
+    if(pid_left == 0){ 
       close(1);
       dup(p[1]);
       close(p[0]);
@@ -228,8 +239,8 @@ runcmd(struct cmd *cmd)
       exit(0);
     }
 
-    int pid_right = fork1();
-    if(pid_right == 0){ // Right child
+    pid_right = fork1();
+    if(pid_right == 0){ 
       close(0);
       dup(p[0]);
       close(p[0]);
@@ -241,135 +252,75 @@ runcmd(struct cmd *cmd)
     close(p[0]);
     close(p[1]);
 
-    // This pipe command might be in the background
-    // We check the 'back' flag on the *left* side (arbitrary, both are part of pipe)
     int is_background = 0;
-    if(pcmd->left->type == EXEC)
-        is_background = ((struct execcmd*)pcmd->left)->back;
-    else if (pcmd->right->type == EXEC)
-        is_background = ((struct execcmd*)pcmd->right)->back;
+    if (pcmd->left->type == EXEC)
+      is_background = ((struct execcmd*)pcmd->left)->back;
 
-    if(is_background){
-        // Lab requires printing PID of the first command
-        add_job(pid_left);
-        // We also add the right job, so it can be reaped
-        // but we only print the first one.
-        add_job(pid_right); 
+    if (is_shell()) {
+      if (is_background) {
+        add_job(pid_left);         
         printf("[%d]\n", pid_left);
-    } else {
-        // Wait for both foreground children
+      } else {
         wait_for_foreground(pid_left);
         wait_for_foreground(pid_right);
+      }
+    } else {
+      int st;
+      wait(&st);
+      wait(&st);
     }
+
     break;
 
   case BACK:
     bcmd = (struct backcmd*)cmd;
-
-    // Mark the inner command as 'background'
-    // This is a bit of a hack, but `parsecmd` doesn't do it.
-    // We only need to handle EXEC and PIPE.
-    if(bcmd->cmd->type == EXEC) {
-        ((struct execcmd*)bcmd->cmd)->back = 1;
-    } else if (bcmd->cmd->type == PIPE) {
-        struct pipecmd* p = (struct pipecmd*)bcmd->cmd;
-        if(p->left->type == EXEC) ((struct execcmd*)p->left)->back = 1;
-        if(p->right->type == EXEC) ((struct execcmd*)p->right)->back = 1;
-    }
-    
+    set_background_flag(bcmd->cmd);
     runcmd(bcmd->cmd);
     break;
   }
-  
-  // Only the initial shell process should reach here.
-  // Child processes will exit(1) or return from built-ins.
 }
 
-int
-getcmd(char *buf, int nbuf, int fd)
-{
-  // if(fd == 0) {
-  //  // Interactive mode
-  //  fprintf(2, "$ ");
-  // }
-  
-  memset(buf, 0, nbuf);
-  
-  // Read a line from fd
-  char *p = buf;
-  int i = 0;
-  while(i < nbuf - 1) {
-    if(read(fd, p, 1) != 1) {
-      if (i == 0) // EOF or error
-        return -1;
-      break; // End of input
-    }
-    if(*p == '\n')
-      break;
-    p++;
-    i++;
-  }
-  *p = '\0'; // Null-terminate
 
-  if(buf[0] == 0) // Handle empty input or EOF
-    return -1;
-
-  return 0;
-}
 
 int
 main(int argc, char *argv[])
 {
   static char buf[100];
   int fd;
+  shellpid = getpid();
 
-  // Init job list
   for(int i = 0; i < NPROC; i++)
     bg_jobs[i] = 0;
 
-  // Shell script execution (Step 4)
   if(argc > 1){
-    // Run from script
     if((fd = open(argv[1], O_RDONLY)) < 0){
       fprintf(2, "sh: cannot open %s\n", argv[1]);
       exit(1);
     }
   } else {
-    // Interactive mode
     fd = 0;
   }
 
-
   while(1){
-    // 1. (僅限互動模式) 收割上一輪的僵屍
-    //    這保證 `[bg ...]` 訊息在 `$` 之前印出
-    // if(fd == 0) {
-    //     reap_zombies();
-    // }
-
-    // 2. (僅限互動模式) 印出提示符
     if(fd == 0) {
-        fprintf(2, "$ ");
+        sleep(1);
+        reap_zombies();
     }
-    
-    // 3. 讀取命令 (getcmd 內部已不再印出 $)
+
     if(getcmd(buf, sizeof(buf), fd) < 0){
       break; // EOF
     }
+
+    if(fd == 0) {
+      reap_zombies();
+    }
+
+    if(buf[0] == '\n' || buf[0] == 0)continue;
+  
+    runcmd(parsecmd(buf));
     
 
-    if(buf[0] == '\n' || buf[0] == 0) // Empty line
-      continue;
-
-    // 4. 執行命令
-    runcmd(parsecmd(buf));
-
-    if(fd == 0){
-      reap_zombies();
-
-    }
   }
-  
   exit(0);
 }
 
@@ -391,9 +342,6 @@ panic(char *s)
   exit(1);
 }
 
-
-//PAGEBREAK!
-// Constructors
 
 struct cmd*
 execcmd(void)
@@ -693,4 +641,36 @@ nulterminate(struct cmd *cmd)
     break;
   }
   return cmd;
+}
+
+int
+getcmd(char *buf, int nbuf, int fd)
+{
+  if(fd == 0) {
+    // Interactive mode
+    fprintf(2, "$ ");
+  }
+ 
+  memset(buf, 0, nbuf);
+ 
+  // Read a line from fd
+  char *p = buf;
+  int i = 0;
+  while(i < nbuf - 1) {
+    if(read(fd, p, 1) != 1) {
+      if (i == 0) // EOF or error
+        return -1;
+      break; // End of input
+    }
+    if(*p == '\n')
+      break;
+    p++;
+    i++;
+  }
+  *p = '\0'; // Null-terminate
+
+  if(buf[0] == 0) // Handle empty input or EOF
+    return -1;
+
+  return 0;
 }
